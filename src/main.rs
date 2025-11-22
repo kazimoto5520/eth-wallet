@@ -1,13 +1,14 @@
 use clap::{Parser, Subcommand};
 use anyhow::Result;
-use ethers::prelude::*;
-use ethers::signers::{coins_bip39::{English, Mnemonic}, MnemonicBuilder};
 use hex::encode as hex_encode;
+use bip39::{Mnemonic, Language};
+use bip32::{DerivationPath, XPrv};
+use ethers::prelude::*;
+use ethers::signers::Signer;
 
-/// Simple Ethereum wallet CLI using ethers v2 only.
 #[derive(Parser)]
 #[command(name = "rust-eth-wallet")]
-#[command(about = "Ethereum wallet in Rust")]
+#[command(about = "Ethereum wallet CLI in Rust")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -15,68 +16,87 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Generate a new mnemonic and first address
     Generate,
-
-    /// Import an existing mnemonic
     Import {
         mnemonic: String,
     },
-
-    /// Derive address by index (BIP44 m/44'/60'/0'/0/index)
     Derive {
         mnemonic: String,
         #[arg(short, long, default_value_t = 0)]
         index: u32,
     },
-
-    /// Sign a message
     Sign {
         mnemonic: String,
         #[arg(short, long, default_value_t = 0)]
         index: u32,
         message: String,
     },
-
-    /// Export private key
     Export {
         mnemonic: String,
         #[arg(short, long, default_value_t = 0)]
         index: u32,
     },
+    Balance {
+        address: String,
+        #[arg(short, long, default_value = "https://ethereum.llamarpc.com")]
+        rpc: String,
+    },
 }
 
-/// Derive a wallet from mnemonic using BIP44 Ethereum path.
 fn derive_wallet(mnemonic: &str, index: u32) -> Result<LocalWallet> {
-    let builder = MnemonicBuilder::<English>::default()
-        .phrase(mnemonic)
-        .derivation_path(&format!("m/44'/60'/0'/0/{}", index))?;
-
-    let wallet = builder.build()?;
-
+    let mnemonic = Mnemonic::parse_in(Language::English, mnemonic)?;
+    
+    // Convert mnemonic to seed
+    let seed = mnemonic.to_seed("");
+    
+    // Create extended private key from seed
+    let xprv = XPrv::new(&seed)?;
+    
+    // Create derivation path
+    let path_str = format!("m/44'/60'/0'/0/{}", index);
+    let path: DerivationPath = path_str.parse()?;
+    
+    // Derive child key using iterator
+    let mut child_xprv = xprv;
+    for child_num in path.as_ref() {
+        child_xprv = child_xprv.derive_child(*child_num)?;
+    }
+    
+    // Get private key bytes as a slice
+    let private_key_bytes = child_xprv.private_key().to_bytes();
+    
+    // Convert to SigningKey first, then to LocalWallet
+    let signing_key = k256::ecdsa::SigningKey::from_bytes(&private_key_bytes)?;
+    let wallet: LocalWallet = LocalWallet::from(signing_key);
+    
     Ok(wallet)
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Generate => {
-            let mnemonic = Mnemonic::<English>::new(&mut rand::thread_rng());
-            println!("Mnemonic: {}", mnemonic.to_phrase());
-
-            let wallet = derive_wallet(&mnemonic.to_phrase(), 0)?;
-            println!("Address (index 0): {:?}", wallet.address());
+            // Generate random entropy (128 bits = 12 words)
+            let mut entropy = [0u8; 16];
+            rand::Rng::fill(&mut rand::thread_rng(), &mut entropy);
+            let mnemonic = Mnemonic::from_entropy_in(Language::English, &entropy)?;
+            
+            println!("Mnemonic: {}", mnemonic);
+            
+            let wallet = derive_wallet(&mnemonic.to_string(), 0)?;
+            println!("Address (0): {:?}", wallet.address());
         }
 
         Commands::Import { mnemonic } => {
             let wallet = derive_wallet(&mnemonic, 0)?;
-            println!("Address: {:?}", wallet.address());
+            println!("Address (0): {:?}", wallet.address());
         }
 
         Commands::Derive { mnemonic, index } => {
             let wallet = derive_wallet(&mnemonic, index)?;
-            println!("Address (index {}): {:?}", index, wallet.address());
+            println!("Address ({}): {:?}", index, wallet.address());
         }
 
         Commands::Sign {
@@ -85,8 +105,8 @@ fn main() -> Result<()> {
             message,
         } => {
             let wallet = derive_wallet(&mnemonic, index)?;
-            let signature = futures::executor::block_on(wallet.sign_message(message))?;
-            println!("Signature: {:?}", signature);
+            let signature = wallet.sign_message(message).await?;
+            println!("Signature: {}", signature);
         }
 
         Commands::Export { mnemonic, index } => {
@@ -94,6 +114,17 @@ fn main() -> Result<()> {
             let pk = wallet.signer().to_bytes();
             println!("Private Key: 0x{}", hex_encode(pk));
             println!("Address: {:?}", wallet.address());
+        }
+
+        Commands::Balance { address, rpc } => {
+            let provider = Provider::<Http>::try_from(rpc)?;
+            let addr = address.parse::<Address>()?;
+            let balance_wei = provider.get_balance(addr, None).await?;
+            let balance_eth = ethers::utils::format_units(balance_wei, "ether")?;
+            
+            println!("Address: {}", addr);
+            println!("Balance (wei): {}", balance_wei);
+            println!("Balance (ETH): {}", balance_eth);
         }
     }
 
